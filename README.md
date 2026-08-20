@@ -1,6 +1,6 @@
 # Gemini Live API + Google ADK
 
-Bu proje, Google AI Studio ücretsiz katmanı üzerinden çalışan bir Gemini Live sesli terminal agentidir. Konuşmalar terminalde yazıya dökülür, Gemini yanıtı hem terminale yazılır hem hoparlörden oynatılır. Agent gerektiğinde Google Search ile güncel bilgi arar.
+Bu proje, Google AI Studio ücretsiz katmanı üzerinden çalışan bir Gemini Live sesli sohbet istemcisidir. Konuşmalar terminalde yazıya dökülür, Gemini yanıtı hem terminale yazılır hem hoparlörden oynatılır.
 
 ## Gereksinimler
 

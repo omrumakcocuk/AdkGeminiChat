@@ -28,6 +28,10 @@ python main.py
 
 Tarayıcı açılmaz. Terminalde `Gemini Live hazır` mesajı göründüğünde konuşmaya başlayın. Çıkmak için `Ctrl+C` kullanın.
 
+Her sesli yanıttan sonra terminalde, kullanıcının konuşmasının yaklaşık bitişinden
+Gemini'nin ilk yanıt sesinin başlamasına kadar geçen geri dönüş süresi gösterilir.
+Ölçüme yapılandırılmış 300 ms konuşma sonu sessizlik algılama süresi de eklenir.
+
 Ses aygıtlarını görmek veya varsayılan olmayan aygıtları seçmek için:
 
 ```bash

@@ -126,6 +126,9 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
     microphone_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
     speaker_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
     playback_active = threading.Event()
+    speech_finished_at: float | None = None
+    playback_started_at: float | None = None
+    pending_response_latency: float | None = None
     loop = asyncio.get_running_loop()
 
     def microphone_callback(indata, frames, timing, status) -> None:
@@ -153,10 +156,13 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
             )
 
     async def play_speaker(output_stream) -> None:
+        nonlocal speech_finished_at, playback_started_at, pending_response_latency
         while True:
             audio = await speaker_queue.get()
             if audio is None:
                 return
+            if not playback_active.is_set():
+                playback_started_at = time.perf_counter()
             playback_active.set()
             await asyncio.to_thread(output_stream.write, audio)
 
@@ -167,6 +173,13 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                     )
                 except TimeoutError:
                     playback_active.clear()
+                    if speech_finished_at is not None and playback_started_at is not None:
+                        pending_response_latency = (
+                            playback_started_at - speech_finished_at + 0.30
+                        )
+                        report_pending_latency()
+                    speech_finished_at = None
+                    playback_started_at = None
                     break
                 if audio is None:
                     playback_active.clear()
@@ -246,9 +259,20 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
             active_transcript_text = ""
             active_rendered_rows = 0
 
+    def report_pending_latency() -> None:
+        nonlocal pending_response_latency
+        if pending_response_latency is None or active_transcript_role is not None:
+            return
+        print(
+            "⏱️ "
+            f"Geri dönüş: {max(0.0, pending_response_latency):.2f} sn"
+        )
+        pending_response_latency = None
+
     async def consume_live_events() -> None:
         nonlocal input_text, output_text
         nonlocal waiting_for_next_user_turn
+        nonlocal speech_finished_at, playback_started_at
         async for event in runner.run_live(
             user_id=user_id,
             session_id=session_id,
@@ -262,6 +286,8 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                     completed_transcripts.clear()
                     waiting_for_next_user_turn = False
                 transcript = event.input_transcription
+                if transcript.text and playback_started_at is None:
+                    speech_finished_at = time.perf_counter()
                 input_text = _merge_transcript(input_text, transcript.text or "")
                 show_transcript("Sen", input_text)
                 if transcript.finished:
@@ -274,6 +300,7 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                 show_transcript("Gemini", output_text)
                 if transcript.finished:
                     finish_transcript("Gemini")
+                    report_pending_latency()
                     output_text = ""
                     waiting_for_next_user_turn = True
 
@@ -288,6 +315,7 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
             if event.turn_complete:
                 finish_transcript("Sen")
                 finish_transcript("Gemini")
+                report_pending_latency()
                 input_text = ""
                 output_text = ""
                 completed_transcripts.clear()

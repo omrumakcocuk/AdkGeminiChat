@@ -202,11 +202,8 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
 
     input_text = ""
     output_text = ""
-    active_transcript_role: str | None = None
-    active_transcript_text = ""
-    active_rendered_rows = 0
-    completed_transcripts: dict[str, str] = {}
-    waiting_for_next_user_turn = False
+    turn_rendered_rows = 0
+    turn_display_open = False
     microphone_task: asyncio.Task[None] | None = None
     speaker_task: asyncio.Task[None] | None = None
     live_task: asyncio.Task[None] | None = None
@@ -215,53 +212,46 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
         columns = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
         return sum(max(1, (len(line) - 1) // columns + 1) for line in text.split("\n"))
 
-    def clear_active_transcript() -> None:
-        if active_rendered_rows <= 0:
+    def clear_turn_display() -> None:
+        if turn_rendered_rows <= 0:
             return
         print("\r", end="")
-        for _ in range(active_rendered_rows - 1):
+        for _ in range(turn_rendered_rows - 1):
             print("\033[1A", end="")
-        for row in range(active_rendered_rows):
+        for row in range(turn_rendered_rows):
             print("\033[2K", end="")
-            if row < active_rendered_rows - 1:
+            if row < turn_rendered_rows - 1:
                 print("\033[1B", end="")
-        for _ in range(active_rendered_rows - 1):
+        for _ in range(turn_rendered_rows - 1):
             print("\033[1A", end="")
         print("\r", end="")
 
-    def show_transcript(role: str, text: str) -> None:
-        nonlocal active_transcript_role, active_transcript_text
-        nonlocal active_rendered_rows
-        clean_text = text.strip()
-        if not clean_text:
+    def show_turn_transcripts() -> None:
+        nonlocal turn_rendered_rows, turn_display_open
+        lines = []
+        if input_text.strip():
+            lines.append(f"Sen: {input_text.strip()}")
+        if output_text.strip():
+            lines.append(f"Gemini: {output_text.strip()}")
+        if not lines:
             return
-        if active_transcript_role and active_transcript_role != role:
-            finish_transcript(active_transcript_role)
-        if completed_transcripts.get(role) == clean_text:
-            return
-        if active_transcript_role == role:
-            if active_transcript_text == clean_text:
-                return
-            clear_active_transcript()
-        rendered_text = f"{role}: {clean_text}"
+        if turn_display_open:
+            clear_turn_display()
+        rendered_text = "\n".join(lines)
         print(rendered_text, end="", flush=True)
-        active_transcript_role = role
-        active_transcript_text = clean_text
-        active_rendered_rows = rendered_rows(rendered_text)
+        turn_rendered_rows = rendered_rows(rendered_text)
+        turn_display_open = True
 
-    def finish_transcript(role: str) -> None:
-        nonlocal active_transcript_role, active_transcript_text
-        nonlocal active_rendered_rows
-        if active_transcript_role == role:
+    def finish_turn_display() -> None:
+        nonlocal turn_rendered_rows, turn_display_open
+        if turn_display_open:
             print()
-            completed_transcripts[role] = active_transcript_text
-            active_transcript_role = None
-            active_transcript_text = ""
-            active_rendered_rows = 0
+            turn_rendered_rows = 0
+            turn_display_open = False
 
     def report_pending_latency() -> None:
         nonlocal pending_response_latency
-        if pending_response_latency is None or active_transcript_role is not None:
+        if pending_response_latency is None or turn_display_open:
             return
         print(
             "⏱️ "
@@ -271,7 +261,6 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
 
     async def consume_live_events() -> None:
         nonlocal input_text, output_text
-        nonlocal waiting_for_next_user_turn
         nonlocal speech_finished_at, playback_started_at
         async for event in runner.run_live(
             user_id=user_id,
@@ -280,29 +269,16 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
             run_config=run_config,
         ):
             if event.input_transcription:
-                if waiting_for_next_user_turn:
-                    input_text = ""
-                    output_text = ""
-                    completed_transcripts.clear()
-                    waiting_for_next_user_turn = False
                 transcript = event.input_transcription
                 if transcript.text and playback_started_at is None:
                     speech_finished_at = time.perf_counter()
                 input_text = _merge_transcript(input_text, transcript.text or "")
-                show_transcript("Sen", input_text)
-                if transcript.finished:
-                    finish_transcript("Sen")
-                    input_text = ""
+                show_turn_transcripts()
 
             if event.output_transcription:
                 transcript = event.output_transcription
                 output_text = _merge_transcript(output_text, transcript.text or "")
-                show_transcript("Gemini", output_text)
-                if transcript.finished:
-                    finish_transcript("Gemini")
-                    report_pending_latency()
-                    output_text = ""
-                    waiting_for_next_user_turn = True
+                show_turn_transcripts()
 
             for part in event.content.parts if event.content else []:
                 if (
@@ -313,13 +289,10 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                     await speaker_queue.put(part.inline_data.data)
 
             if event.turn_complete:
-                finish_transcript("Sen")
-                finish_transcript("Gemini")
+                finish_turn_display()
                 report_pending_latency()
                 input_text = ""
                 output_text = ""
-                completed_transcripts.clear()
-                waiting_for_next_user_turn = True
 
     try:
         print("Gemini Live bağlantısı kuruluyor...")

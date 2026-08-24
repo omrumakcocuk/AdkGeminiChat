@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import logging
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -104,6 +103,11 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
 
     # The agent reads its model from the environment during import.
     from app.google_search_agent.agent import root_agent
+    from app.google_search_agent.tool_telemetry import (
+        begin_request,
+        end_request,
+        update_request_start,
+    )
 
     logging.getLogger("google_adk").setLevel(logging.WARNING)
     logging.getLogger("google.adk").setLevel(logging.WARNING)
@@ -129,6 +133,7 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
     speech_finished_at: float | None = None
     playback_started_at: float | None = None
     pending_response_latency: float | None = None
+    voice_request_active = False
     loop = asyncio.get_running_loop()
 
     def microphone_callback(indata, frames, timing, status) -> None:
@@ -163,6 +168,10 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                 return
             if not playback_active.is_set():
                 playback_started_at = time.perf_counter()
+                if speech_finished_at is not None:
+                    pending_response_latency = (
+                        playback_started_at - speech_finished_at + 0.30
+                    )
             playback_active.set()
             await asyncio.to_thread(output_stream.write, audio)
 
@@ -173,11 +182,6 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                     )
                 except TimeoutError:
                     playback_active.clear()
-                    if speech_finished_at is not None and playback_started_at is not None:
-                        pending_response_latency = (
-                            playback_started_at - speech_finished_at + 0.30
-                        )
-                        report_pending_latency()
                     speech_finished_at = None
                     playback_started_at = None
                     break
@@ -202,66 +206,25 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
 
     input_text = ""
     output_text = ""
-    turn_rendered_rows = 0
-    turn_display_open = False
+    input_line_printed = False
     microphone_task: asyncio.Task[None] | None = None
     speaker_task: asyncio.Task[None] | None = None
     live_task: asyncio.Task[None] | None = None
 
-    def rendered_rows(text: str) -> int:
-        columns = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
-        return sum(max(1, (len(line) - 1) // columns + 1) for line in text.split("\n"))
-
-    def clear_turn_display() -> None:
-        if turn_rendered_rows <= 0:
-            return
-        print("\r", end="")
-        for _ in range(turn_rendered_rows - 1):
-            print("\033[1A", end="")
-        for row in range(turn_rendered_rows):
-            print("\033[2K", end="")
-            if row < turn_rendered_rows - 1:
-                print("\033[1B", end="")
-        for _ in range(turn_rendered_rows - 1):
-            print("\033[1A", end="")
-        print("\r", end="")
-
-    def show_turn_transcripts() -> None:
-        nonlocal turn_rendered_rows, turn_display_open
-        lines = []
-        if input_text.strip():
-            lines.append(f"Sen: {input_text.strip()}")
-        if output_text.strip():
-            lines.append(f"Gemini: {output_text.strip()}")
-        if not lines:
-            return
-        if turn_display_open:
-            clear_turn_display()
-        rendered_text = "\n".join(lines)
-        print(rendered_text, end="", flush=True)
-        turn_rendered_rows = rendered_rows(rendered_text)
-        turn_display_open = True
-
-    def finish_turn_display() -> None:
-        nonlocal turn_rendered_rows, turn_display_open
-        if turn_display_open:
-            print()
-            turn_rendered_rows = 0
-            turn_display_open = False
-
     def report_pending_latency() -> None:
         nonlocal pending_response_latency
-        if pending_response_latency is None or turn_display_open:
+        if pending_response_latency is None:
             return
         print(
-            "⏱️ "
-            f"Geri dönüş: {max(0.0, pending_response_latency):.2f} sn"
+            "🔊 Sesli yanıt tepkimesi: "
+            f"{max(0.0, pending_response_latency):.2f} sn"
         )
         pending_response_latency = None
 
     async def consume_live_events() -> None:
         nonlocal input_text, output_text
         nonlocal speech_finished_at, playback_started_at
+        nonlocal voice_request_active, input_line_printed
         async for event in runner.run_live(
             user_id=user_id,
             session_id=session_id,
@@ -272,13 +235,19 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                 transcript = event.input_transcription
                 if transcript.text and playback_started_at is None:
                     speech_finished_at = time.perf_counter()
+                    if voice_request_active:
+                        update_request_start(speech_finished_at)
+                    else:
+                        begin_request(speech_finished_at)
+                        voice_request_active = True
                 input_text = _merge_transcript(input_text, transcript.text or "")
-                show_turn_transcripts()
+                if transcript.finished and not input_line_printed and input_text.strip():
+                    print(input_text.strip())
+                    input_line_printed = True
 
             if event.output_transcription:
                 transcript = event.output_transcription
                 output_text = _merge_transcript(output_text, transcript.text or "")
-                show_turn_transcripts()
 
             for part in event.content.parts if event.content else []:
                 if (
@@ -289,10 +258,17 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                     await speaker_queue.put(part.inline_data.data)
 
             if event.turn_complete:
-                finish_turn_display()
+                if not input_line_printed and input_text.strip():
+                    print(input_text.strip())
+                if output_text.strip():
+                    print(f"Gemini: {output_text.strip()}")
                 report_pending_latency()
+                end_request()
+                voice_request_active = False
                 input_text = ""
                 output_text = ""
+                input_line_printed = False
+                print("Sen: ", end="", flush=True)
 
     try:
         print("Gemini Live bağlantısı kuruluyor...")
@@ -320,6 +296,7 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
             microphone_task = asyncio.create_task(send_microphone())
             speaker_task = asyncio.create_task(play_speaker(output_stream))
             print("Gemini Live hazır. Konuşabilirsiniz. Çıkmak için Ctrl+C.\n")
+            print("Sen: ", end="", flush=True)
             await live_task
 
     except asyncio.CancelledError:
@@ -365,6 +342,20 @@ def _open_browser_when_ready(host: str, port: int) -> None:
             time.sleep(0.2)
 
 
+def _clear_proxy_env() -> None:
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "SOCKS_PROXY",
+        "socks_proxy",
+    ]:
+        os.environ.pop(key, None)
+
+
 def _run_web(arguments: list[str]) -> int:
     try:
         import certifi
@@ -390,17 +381,138 @@ def _run_web(arguments: list[str]) -> int:
     )
 
 
-def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] == "--web":
-        return _run_web(sys.argv[2:])
-
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Gemini Live ile terminalden sesli konuşun."
+        description="Gemini ile terminalden konuşun veya metin sohbeti yapın."
     )
+    parser.add_argument("--web", action="store_true", help="ADK web arayüzünü aç")
+    parser.add_argument("--text", action="store_true", help="Terminal metin sohbeti modunu aç")
     parser.add_argument("--list-devices", action="store_true", help="Ses aygıtlarını listele")
     parser.add_argument("--input-device", help="Mikrofon aygıt numarası veya adı")
     parser.add_argument("--output-device", help="Hoparlör aygıt numarası veya adı")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+async def _run_text_terminal() -> int:
+    try:
+        from dotenv import load_dotenv
+        from google.adk.runners import Runner
+        from google.adk.sessions import InMemorySessionService
+        from google.genai import types
+    except ImportError as error:
+        print(
+            f"Eksik bağımlılık ({error.name}). Çalıştırın: "
+            "python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 1
+
+    load_dotenv(APP_DIR / ".env", override=True)
+    _clear_proxy_env()
+
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        print("app/.env içinde GOOGLE_API_KEY eksik.", file=sys.stderr)
+        return 1
+
+    # The Live model can be native-audio-only, so text mode has its own model.
+    # The same ADK agent and the same 20 tools are still used.
+    from app.google_search_agent.agent import root_agent
+    from app.google_search_agent.tool_telemetry import begin_request, end_request
+
+    text_model = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
+    # Text and Live use the same coordinator/sub-agent topology and robot tools.
+    # Gemini 3.x text models reject thinking_budget=0. MINIMAL is their lowest
+    # supported latency setting; native-audio Live still uses budget 0.
+    text_config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(
+            thinking_level=types.ThinkingLevel.MINIMAL,
+            include_thoughts=False,
+        ),
+    )
+    text_agent = root_agent.clone(
+        update={
+            "model": text_model,
+            "generate_content_config": text_config,
+        }
+    )
+    # A transfer in text mode must keep using the text-compatible model.
+    for sub_agent in text_agent.sub_agents:
+        sub_agent.model = text_model
+        sub_agent.generate_content_config = text_config.model_copy(deep=True)
+    app_name = "robot_text_agent"
+    user_id = "terminal-user"
+    session_id = str(uuid.uuid4())
+    sessions = InMemorySessionService()
+    await sessions.create_session(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    runner = Runner(
+        app_name=app_name,
+        agent=text_agent,
+        session_service=sessions,
+    )
+    if os.getenv("GEMINI_TEXT_WARMUP", "TRUE").upper() == "TRUE":
+        warmup_session_id = f"warmup-{uuid.uuid4()}"
+        await sessions.create_session(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=warmup_session_id,
+        )
+        async for _event in runner.run_async(
+            user_id=user_id,
+            session_id=warmup_session_id,
+            new_message=types.Content(
+                role="user",
+                parts=[types.Part(text="Yalnızca hazır yaz; araç kullanma.")],
+            ),
+        ):
+            pass
+    print(
+        "ADK robot metin modu hazır. Her fonksiyonun çalışmaya başlama süresi "
+        "gösterilir. Çıkmak için Ctrl+C."
+    )
+
+    try:
+        while True:
+            try:
+                prompt = await asyncio.to_thread(input, "\nSen: ")
+            except (KeyboardInterrupt, EOFError):
+                print("\nOturum kapatıldı.")
+                return 0
+
+            if not prompt.strip():
+                continue
+
+            request_started_at = time.perf_counter()
+            begin_request(request_started_at)
+            try:
+                async for _event in runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=types.Content(
+                        role="user",
+                        parts=[types.Part(text=prompt)],
+                    ),
+                ):
+                    pass
+            finally:
+                end_request()
+    finally:
+        await runner.close()
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if len(argv) > 0 and argv[0] == "--web":
+        return _run_web(argv[1:])
+
+    args = parse_cli_args(argv)
+
+    if args.web:
+        return _run_web([])
 
     if args.list_devices:
         try:
@@ -411,6 +523,13 @@ def main() -> int:
         except Exception as error:
             print(f"Ses aygıtları okunamadı: {error}", file=sys.stderr)
             return 1
+
+    if args.text:
+        try:
+            return asyncio.run(_run_text_terminal())
+        except KeyboardInterrupt:
+            print("\nOturum kapatıldı.")
+            return 0
 
     try:
         return asyncio.run(

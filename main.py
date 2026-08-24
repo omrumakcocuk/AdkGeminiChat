@@ -11,8 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+import textwrap
 import uuid
 import webbrowser
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -106,6 +108,8 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
     from app.google_search_agent.tool_telemetry import (
         begin_request,
         end_request,
+        record_model_usage,
+        update_request_text,
         update_request_start,
     )
 
@@ -231,6 +235,7 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
             live_request_queue=live_queue,
             run_config=run_config,
         ):
+            record_model_usage(event)
             if event.input_transcription:
                 transcript = event.input_transcription
                 if transcript.text and playback_started_at is None:
@@ -238,9 +243,11 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                     if voice_request_active:
                         update_request_start(speech_finished_at)
                     else:
-                        begin_request(speech_finished_at)
+                        begin_request(speech_finished_at, mode="voice")
                         voice_request_active = True
                 input_text = _merge_transcript(input_text, transcript.text or "")
+                if input_text.strip():
+                    update_request_text(input_text)
                 if transcript.finished and not input_line_printed and input_text.strip():
                     print(input_text.strip())
                     input_line_printed = True
@@ -263,7 +270,7 @@ async def _run_terminal(input_device: int | str | None, output_device: int | str
                 if output_text.strip():
                     print(f"Gemini: {output_text.strip()}")
                 report_pending_latency()
-                end_request()
+                end_request(output_text)
                 voice_request_active = False
                 input_text = ""
                 output_text = ""
@@ -390,7 +397,219 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--list-devices", action="store_true", help="Ses aygıtlarını listele")
     parser.add_argument("--input-device", help="Mikrofon aygıt numarası veya adı")
     parser.add_argument("--output-device", help="Hoparlör aygıt numarası veya adı")
+    parser.add_argument(
+        "--history",
+        nargs="?",
+        type=int,
+        const=20,
+        metavar="ADET",
+        help="Kalıcı komut ve robot işlem geçmişini göster (varsayılan: 20)",
+    )
     return parser.parse_args(argv)
+
+
+def _print_history(limit: int) -> int:
+    from app.google_search_agent.robot_memory import database_path, get_history
+
+    history = get_history(limit)
+    print(f"\nROBOT KONUŞMA GEÇMİŞİ  •  {database_path()}")
+    if not history:
+        print("\nHenüz kayıt yok.")
+        return 0
+    for position, item in enumerate(history, start=1):
+        created = datetime.fromisoformat(item["created_at"]).astimezone()
+        mode = "SESLİ" if item["mode"] == "voice" else "METİN"
+        print(f"\n╭─ #{position}  {created:%d.%m.%Y %H:%M:%S}  •  {mode}")
+        _print_history_text("│  SEN       ", item["user_text"] or "(metin yok)")
+        if not item["actions"]:
+            print("│  İŞLEMLER  —")
+        for action_number, action in enumerate(item["actions"], start=1):
+            arguments = _history_fields(action["arguments"])
+            result = dict(action["result"])
+            api_elapsed = result.pop("_api_elapsed_ms", None)
+            status = result.pop("status", None)
+            outcome = _history_fields(result)
+            status_text = "başarılı" if status == "success" else (status or "tamamlandı")
+            details = f"{status_text}"
+            if outcome:
+                details += f" • {outcome}"
+            if api_elapsed is not None:
+                details += f" • API {api_elapsed:.1f} ms"
+            print(f"│  İŞLEM {action_number:<2}  {action['tool_name']}")
+            if arguments:
+                print(f"│             Girdi: {arguments}")
+            print(f"│             Sonuç: {details}")
+        if item["assistant_text"]:
+            _print_history_text("│  GEMINI    ", item["assistant_text"])
+        if item.get("usage"):
+            summary = _usage_summary(item["usage"], item["mode"])
+            print("│")
+            print("│  KULLANIM DETAYI")
+            print(f"│    Model response sayısı : {summary['response_count']:,}")
+            print(f"│    Toplam token          : {summary['total_tokens']:,}")
+            print(f"│    Giriş tokenı          : {summary['input_total']:,}")
+            _print_token_modalities("Giriş türleri", summary["input_modalities"])
+            print(f"│      Tool-use girdisi    : {summary['tool_tokens']:,}")
+            print(f"│      Cache tokenı        : {summary['cached_tokens']:,}")
+            print(f"│    Çıkış tokenı          : {summary['output_total']:,}")
+            _print_token_modalities("Çıkış türleri", summary["output_modalities"])
+            print(f"│      Normal cevap        : {summary['candidate_tokens']:,}")
+            print(f"│      Thinking            : {summary['thinking_tokens']:,}")
+            print("│")
+            print("│  MODEL MALİYETLERİ")
+            for model, model_data in summary["models"].items():
+                print(
+                    f"│    {model or '(model adı yok)'} "
+                    f"({model_data['responses']} response): "
+                    f"≈ ${model_data['cost_usd']:.6f}"
+                )
+            print(
+                f"│  TOPLAM MALİYET          : ≈ ${summary['cost_usd']:.6f} USD"
+            )
+            print("│  Not: 24.08.2026 standart liste fiyatıyla tahmini hesap.")
+        else:
+            print("│  KULLANIM  bu eski kayıt için kullanım verisi yok")
+        print("╰" + "─" * 88)
+    return 0
+
+
+def _history_fields(values: dict) -> str:
+    def readable(value) -> str:
+        if value is True:
+            return "açık"
+        if value is False:
+            return "kapalı"
+        return str(value)
+
+    return ", ".join(f"{key}={readable(value)}" for key, value in values.items())
+
+
+def _modality_tokens(details: list[dict] | None) -> dict[str, int]:
+    tokens: dict[str, int] = {}
+    for detail in details or []:
+        modality = str(detail.get("modality", "text")).split(".")[-1].lower()
+        tokens[modality] = tokens.get(modality, 0) + int(detail.get("token_count", 0))
+    return tokens
+
+
+def _add_token_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for kind, count in source.items():
+        target[kind] = target.get(kind, 0) + count
+
+
+def _print_token_modalities(label: str, modalities: dict[str, int]) -> None:
+    ordered = ("text", "audio", "image", "video", "document", "modality_unspecified")
+    labels = {
+        "modality_unspecified": "other",
+    }
+    values = [
+        f"{labels.get(kind, kind)}={modalities.get(kind, 0):,}" for kind in ordered
+    ]
+    extras = [
+        f"{kind}={count:,}"
+        for kind, count in sorted(modalities.items())
+        if kind not in ordered
+    ]
+    print(f"│      {label:<19}: {' • '.join(values[:3])}")
+    print(f"│      {'':<19}  {' • '.join(values[3:] + extras)}")
+
+
+def _usage_summary(records: list[dict], mode: str) -> dict:
+    """Calculate estimated standard-tier USD cost at 2026-08-24 prices."""
+    summary = {
+        "response_count": len(records),
+        "input_total": 0,
+        "output_total": 0,
+        "candidate_tokens": 0,
+        "thinking_tokens": 0,
+        "tool_tokens": 0,
+        "cached_tokens": 0,
+        "total_tokens": 0,
+        "input_modalities": {},
+        "output_modalities": {},
+        "models": {},
+        "cost_usd": 0.0,
+    }
+    for record in records:
+        usage = record.get("usage", {})
+        prompt = int(usage.get("prompt_token_count", 0))
+        tool_tokens = int(usage.get("tool_use_prompt_token_count", 0))
+        candidates = int(usage.get("candidates_token_count", 0))
+        thoughts = int(usage.get("thoughts_token_count", 0))
+        cached = int(usage.get("cached_content_token_count", 0))
+        input_total = prompt + tool_tokens
+        output_total = candidates + thoughts
+        summary["input_total"] += input_total
+        summary["output_total"] += output_total
+        summary["candidate_tokens"] += candidates
+        summary["thinking_tokens"] += thoughts
+        summary["tool_tokens"] += tool_tokens
+        summary["cached_tokens"] += cached
+        summary["total_tokens"] += int(
+            usage.get("total_token_count", input_total + output_total)
+        )
+        model = record.get("model", "")
+        is_live = "live" in model.lower() or (
+            mode == "voice" and record.get("author") == "robot_coordinator"
+        )
+        input_details = _modality_tokens(usage.get("prompt_tokens_details"))
+        if not input_details and prompt:
+            input_details = {"text": prompt}
+        tool_details = _modality_tokens(usage.get("tool_use_prompt_tokens_details"))
+        if not tool_details and tool_tokens:
+            tool_details = {"text": tool_tokens}
+        _add_token_counts(input_details, tool_details)
+        missing_input = max(0, input_total - sum(input_details.values()))
+        if missing_input:
+            input_details["text"] = input_details.get("text", 0) + missing_input
+        output_details = _modality_tokens(usage.get("candidates_tokens_details"))
+        if not output_details and candidates:
+            output_details = {"text": candidates}
+        missing_output = max(0, candidates - sum(output_details.values()))
+        if missing_output:
+            output_details["text"] = output_details.get("text", 0) + missing_output
+        _add_token_counts(summary["input_modalities"], input_details)
+        _add_token_counts(summary["output_modalities"], output_details)
+
+        if is_live:
+            input_rates = {
+                "text": 0.75,
+                "audio": 3.00,
+                "image": 1.00,
+                "video": 1.00,
+                "document": 1.00,
+                "modality_unspecified": 0.75,
+            }
+            output_rates = {"text": 4.50, "audio": 12.00}
+            record_cost = sum(
+                count * input_rates.get(kind, 0.75) / 1_000_000
+                for kind, count in input_details.items()
+            )
+            record_cost += sum(
+                count * output_rates.get(kind, 4.50) / 1_000_000
+                for kind, count in output_details.items()
+            )
+            record_cost += thoughts * 4.50 / 1_000_000
+        else:
+            uncached_input = max(0, input_total - cached)
+            record_cost = uncached_input * 0.75 / 1_000_000
+            record_cost += cached * 0.075 / 1_000_000
+            record_cost += output_total * 3.75 / 1_000_000
+        model_data = summary["models"].setdefault(
+            model, {"responses": 0, "cost_usd": 0.0}
+        )
+        model_data["responses"] += 1
+        model_data["cost_usd"] += record_cost
+        summary["cost_usd"] += record_cost
+    return summary
+
+
+def _print_history_text(label: str, value: str) -> None:
+    lines = textwrap.wrap(value.strip(), width=74) or [""]
+    print(label + lines[0])
+    continuation = "│" + " " * (len(label) - 1)
+    for line in lines[1:]:
+        print(continuation + line)
 
 
 async def _run_text_terminal() -> int:
@@ -418,7 +637,11 @@ async def _run_text_terminal() -> int:
     # The Live model can be native-audio-only, so text mode has its own model.
     # The same ADK agent and the same 20 tools are still used.
     from app.google_search_agent.agent import root_agent
-    from app.google_search_agent.tool_telemetry import begin_request, end_request
+    from app.google_search_agent.tool_telemetry import (
+        begin_request,
+        end_request,
+        record_model_usage,
+    )
 
     text_model = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
     # Text and Live use the same coordinator/sub-agent topology and robot tools.
@@ -485,11 +708,15 @@ async def _run_text_terminal() -> int:
 
             if not prompt.strip():
                 continue
+            if prompt.strip().lower() in {"/gecmis", "/geçmiş", "geçmiş"}:
+                _print_history(20)
+                continue
 
             request_started_at = time.perf_counter()
-            begin_request(request_started_at)
+            begin_request(request_started_at, prompt, "text")
+            response_parts: list[str] = []
             try:
-                async for _event in runner.run_async(
+                async for event in runner.run_async(
                     user_id=user_id,
                     session_id=session_id,
                     new_message=types.Content(
@@ -497,9 +724,13 @@ async def _run_text_terminal() -> int:
                         parts=[types.Part(text=prompt)],
                     ),
                 ):
-                    pass
+                    record_model_usage(event)
+                    if event.content:
+                        for part in event.content.parts:
+                            if part.text and event.author == text_agent.name:
+                                response_parts.append(part.text)
             finally:
-                end_request()
+                end_request("".join(response_parts))
     finally:
         await runner.close()
 
@@ -510,6 +741,9 @@ def main() -> int:
         return _run_web(argv[1:])
 
     args = parse_cli_args(argv)
+
+    if args.history is not None:
+        return _print_history(args.history)
 
     if args.web:
         return _run_web([])

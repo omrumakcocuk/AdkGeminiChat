@@ -19,8 +19,9 @@ arasında beşer adet paylaştırılır. Aynı Live turundaki bağımsız agent-
 çağrıları paralel çalışabilir ve koordinatör işlemi ikinci kez uygulamaz.
 Araçlar değerleri doğrudan bellekten okumaz; paralel istek kabul eden yerel bir
 HTTP robot API'sine bağlanır. API'nin arkasındaki değerler süreç belleğinde
-simüle edilir ve uygulama yeniden başladığında başlangıç durumuna döner. Örnek
-sesli komutlar:
+simüle edilir ve uygulama yeniden başladığında başlangıç durumuna döner. Kullanıcı
+komutları, çalışan fonksiyonlar, argümanlar, sonuçlar ve Gemini yanıtları ise
+SQLite tabanlı kalıcı işlem geçmişine kaydedilir. Örnek sesli komutlar:
 
 ```text
 Robotun sıcaklığı kaç derece?
@@ -33,8 +34,8 @@ Robotun genel durumunu söyle.
 
 Koordinatör, düşük tepki süresi için araçları doğrudan kullanır. Bağımsız birden
 fazla işlem aynı model turunda istenir; gerçek asenkron API adaptörleri daha sonra
-aynı araç fonksiyonlarının içine eklenebilir. Uzman agent'lar ayrıca ADK agent
-transferleri için koordinatörün alt agent'ları olarak kayıtlıdır.
+aynı araç fonksiyonlarının içine eklenebilir. Uzman agent'lar bağımsız `AgentTool`
+olarak çalışır; agent transferi kullanılmaz.
 
 ## Gereksinimler
 
@@ -79,6 +80,16 @@ Robot araçlarını yazıyla ve gecikme ölçümüyle denemek için:
 python main.py --text
 ```
 
+Kalıcı geçmişi text modu içinden `geçmiş` veya `/gecmis` yazarak görebilirsiniz.
+Uygulamayı açmadan son 20 kaydı veya istediğiniz sayıyı listelemek için:
+
+```bash
+python main.py --history
+python main.py --history 5
+```
+
+Geçmiş varsayılan olarak Git'e eklenmeyen `app/robot_memory.db` dosyasındadır.
+
 Text modundaki Gemini 3.x modelinde thinking `MINIMAL`, terminal Live native-audio
 modelinde ve uzman agent'larda ise desteklenen en düşük değer olan bütçe `0`
 olarak ayarlanır.
@@ -117,6 +128,7 @@ Web sunucusu hazır olduğunda tarayıcı otomatik açılır. Native-audio model
 | `GEMINI_TEXT_WARMUP` | İlk komuttan önce model bağlantısını ısıtır (`TRUE`) |
 | `ROBOT_API_DELAY_MS` | Yerel robot API'sinin simüle ağ/işlem gecikmesi (ms) |
 | `ROBOT_API_BASE_URL` | İsteğe bağlı gerçek veya ayrı çalışan robot API adresi |
+| `ROBOT_MEMORY_DB` | İsteğe bağlı kalıcı SQLite geçmiş dosyasının yolu |
 
 Sesli tool calling için `gemini-3.1-flash-live-preview` kullanılır. Önceki 2.5
 native-audio preview modeli ses transkripsiyonunu üretse de function call aşamasında

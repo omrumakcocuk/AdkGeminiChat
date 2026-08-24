@@ -12,7 +12,7 @@ from .robot_tools import (
     SENSOR_TOOLS,
     SYSTEM_TOOLS,
 )
-from .tool_telemetry import report_tool_start
+from .tool_telemetry import record_tool_result, report_tool_start
 
 
 MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
@@ -47,6 +47,12 @@ def _report_started_tool(tool, args, tool_context) -> None:
     )
 
 
+def _record_completed_tool(tool, args, tool_context, tool_response) -> None:
+    """Persist the actual function arguments and result after completion."""
+    del tool_context
+    record_tool_result(tool.name, args, tool_response)
+
+
 def _specialist(name: str, description: str, tools: list) -> Agent:
     return Agent(
         name=name,
@@ -60,6 +66,7 @@ def _specialist(name: str, description: str, tools: list) -> Agent:
         tools=tools,
         generate_content_config=_specialist_config(),
         before_tool_callback=_report_started_tool,
+        after_tool_callback=_record_completed_tool,
     )
 
 
